@@ -1,0 +1,18 @@
+# 忽略特定的文件
+secret.txt
+.DS_Store
+
+# 忽略整个文件夹 (通常是编译输出或依赖包)
+node_modules/
+dist/
+build/
+__pycache__/
+
+# 忽略某种后缀的文件
+*.log
+*.tmp
+*.zip
+
+# 忽略 IDE 的配置文件 (推荐)
+.vscode/
+.idea/
