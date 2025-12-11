@@ -13,7 +13,9 @@ from models_plain import (
 )
 from models_secret import (
     SecretFastHadamardRetriever,
-    SecretOptimizedFastHadamardRetriever
+    SecretOptimizedFastHadamardRetriever,
+    SecretFastHadamardRetriever_PublicPerm,
+    SecretOptimizedFastHadamardRetriever_PublicPerm
 )
 
 
@@ -55,11 +57,9 @@ def run_benchmark():
     # 4. 运行明文模型
     models = [
         ("1. Random Matrix (Single)", RandomMatrixRetriever(960, BITS, DEVICE), "O(N^2) Mul | MPC不可用"),
-        ("2. Random Matrix (Multi) ", MultiTableRandomRetriever(960, BITS, num_tables=4, device=DEVICE),
-         "O(N^2) Mul | 对照组"),
+        ("2. Random Matrix (Multi) ", MultiTableRandomRetriever(960, BITS, num_tables=4, device=DEVICE), "O(N^2) Mul | 对照组"),
         ("3. FWHT (Basic)          ", FastHadamardRetriever(960, BITS, DEVICE), "O(N log N) Add | 极速+无乘法"),
-        ("4. FWHT (Optimized Multi)", OptimizedFastHadamardRetriever(960, BITS, num_tables=4, device=DEVICE),
-         "O(N log N) Add | 冠军方案"),
+        ("4. FWHT (Optimized Multi)", OptimizedFastHadamardRetriever(960, BITS, num_tables=4, device=DEVICE), "O(N log N) Add | 冠军方案"),
     ]
 
     print(f"\n{'Model Name':<30} | {'Rec@10(Top100)':<15} | {'Build(s)':<9} | {'Query(s)':<9} | {'Algorithm Note'}")
@@ -91,15 +91,11 @@ def run_benchmark():
     # 5. 运行 SecretFlow 秘密方案
     print("-" * 110)
 
-    # >>> 修复了这里的元组，添加了第三个 note 字段 <<<
     secret_models = [
-        ("5. Secret FWHT (Basic)",
-         SecretFastHadamardRetriever(spu_device, model_instances[2], client, s1),
-         "SPU MPC Implementation"),
-
-        ("6. Secret FWHT (Opt)  ",
-         SecretOptimizedFastHadamardRetriever(spu_device, model_instances[3], client, s1),
-         "SPU MPC Implementation"),
+        ("5. Secret FWHT (Basic)", SecretFastHadamardRetriever(spu_device, model_instances[2], client, s1), "O(N log N) Add"),
+        ("6. Secret FWHT (Opt)  ", SecretOptimizedFastHadamardRetriever(spu_device, model_instances[3], client, s1), "O(N log N) Add"),
+        ("7. Semi-Priv FWHT (Basic)", SecretFastHadamardRetriever_PublicPerm(spu_device, model_instances[2], client, s1),"O(N log N) Add"),
+        ("8. Semi-Priv FWHT (Opt)  ", SecretOptimizedFastHadamardRetriever_PublicPerm(spu_device, model_instances[3], client, s1), "O(N log N) Add"),
     ]
 
     qs_np = qs.cpu().numpy()
