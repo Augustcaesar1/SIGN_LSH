@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import torch
 import time
-from unittest.mock import Mock
+import secretflow as sf
 
 # 导入要测试的模块
 from models_secret import (
@@ -16,31 +16,6 @@ from data_loader import GISTDataLoader
 
 class MockPlainModel:
     """模拟 PlainModel 对象 - GIST-960 数据集适配"""
-    def __init__(self, h_dim=512, num_tables=4, num_bits=64):
-        # GIST-960 数据集配置
-        self.h_dim = h_dim
-        self.input_dim = 960  # GIST-960 的输入维度
-        self.D = torch.randn(h_dim)
-        self.perm = torch.randperm(h_dim)
-        self.D_diags = torch.randn(num_tables, h_dim)
-        self.perms = torch.randperm(h_dim).unsqueeze(0).repeat(num_tables, 1)
-
-
-class MockSPU:
-    """模拟 SPU 执行环境"""
-    def __init__(self):
-        pass
-    
-    def __call__(self, func):
-        """模拟 SPU 计算"""
-        def wrapper(*args, **kwargs):
-            # 直接执行函数（不做实际秘密计算）
-            return func(*args, **kwargs)
-        return wrapper
-
-
-class MockPlainModel:
-    """模拟 PlainModel 对象 - GIST-960 数据集适配"""
     def __init__(self, h_dim=1024, num_tables=4, num_bits=64):
         self.h_dim = h_dim
         self.input_dim = 960  # GIST-960 的输入维度
@@ -50,11 +25,19 @@ class MockPlainModel:
         self.perms = torch.stack([torch.randperm(h_dim)[:num_bits] for _ in range(num_tables)])
 
 
-class MockSPU:
-    """模拟 SPU 执行环境"""
-    def __call__(self, func):
-        """模拟 SPU 计算"""
-        return func
+@pytest.fixture(scope="module")
+def sf_setup():
+    """初始化 SecretFlow 环境"""
+    sf.shutdown()
+    sf.init(['alice', 'bob'], address='local')
+    
+    alice = sf.PYU('alice')
+    bob = sf.PYU('bob')
+    spu = sf.SPU(sf.utils.testing.cluster_def(['alice', 'bob']))
+    
+    yield alice, bob, spu
+    
+    sf.shutdown()
 
 
 class TestPerformance:
@@ -94,8 +77,9 @@ class TestPerformance:
             ("SecretOptimizedFastHadamardRetriever_PublicPerm", SecretOptimizedFastHadamardRetriever_PublicPerm),
         ]
     
-    def test_build_performance(self, gist960_data, retriever_configs):
+    def test_build_performance(self, gist960_data, retriever_configs, sf_setup):
         """测试构建阶段性能"""
+        alice, bob, spu = sf_setup
         scale = gist960_data['scale']
         db, qs = gist960_data['db'], gist960_data['qs']
         
@@ -105,9 +89,6 @@ class TestPerformance:
         
         for name, RetrieverClass in retriever_configs:
             plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            spu = MockSPU()
-            alice = Mock()
-            bob = Mock()
             
             retriever = RetrieverClass(spu, plain_model, alice, bob)
             
@@ -122,8 +103,9 @@ class TestPerformance:
             
             assert retriever.secret_params is not None
     
-    def test_query_performance_single(self, gist960_data, retriever_configs):
+    def test_query_performance_single(self, gist960_data, retriever_configs, sf_setup):
         """测试单条查询性能"""
+        alice, bob, spu = sf_setup
         scale = gist960_data['scale']
         db, qs = gist960_data['db'], gist960_data['qs']
         
@@ -133,9 +115,6 @@ class TestPerformance:
         
         for name, RetrieverClass in retriever_configs:
             plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            spu = MockSPU()
-            alice = Mock()
-            bob = Mock()
             
             retriever = RetrieverClass(spu, plain_model, alice, bob)
             retriever.build_secret()
@@ -148,8 +127,9 @@ class TestPerformance:
             print(f"  Single query time: {t_query:.4f}s")
             print(f"  Output shape: {fp.shape if hasattr(fp, 'shape') else 'N/A'}")
     
-    def test_query_performance_batch(self, gist960_data, retriever_configs):
+    def test_query_performance_batch(self, gist960_data, retriever_configs, sf_setup):
         """测试批量查询性能"""
+        alice, bob, spu = sf_setup
         scale = gist960_data['scale']
         db, qs = gist960_data['db'], gist960_data['qs']
         
@@ -161,9 +141,6 @@ class TestPerformance:
         
         for name, RetrieverClass in retriever_configs:
             plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            spu = MockSPU()
-            alice = Mock()
-            bob = Mock()
             
             retriever = RetrieverClass(spu, plain_model, alice, bob)
             retriever.build_secret()
@@ -180,8 +157,9 @@ class TestPerformance:
                 avg_time = t_query / batch_size
                 print(f"  Batch size {batch_size:3d}: {t_query:.4f}s total, {avg_time:.6f}s per query")
     
-    def test_end_to_end_performance(self, gist960_data, retriever_configs):
+    def test_end_to_end_performance(self, gist960_data, retriever_configs, sf_setup):
         """端到端性能测试"""
+        alice, bob, spu = sf_setup
         scale = gist960_data['scale']
         db, qs = gist960_data['db'], gist960_data['qs']
         train_limit = gist960_data['train_limit']
@@ -197,9 +175,6 @@ class TestPerformance:
         
         for name, RetrieverClass in retriever_configs:
             plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            spu = MockSPU()
-            alice = Mock()
-            bob = Mock()
             
             retriever = RetrieverClass(spu, plain_model, alice, bob)
             
