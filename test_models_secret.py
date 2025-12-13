@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import secretflow as sf
+import spu  # <--- [FIX 1] 必须导入 spu 包
 
 # 导入你的模型
 from models_secret import UnifiedSecretHadamardRetriever
@@ -49,7 +50,7 @@ def pack_secret_output(fp_01_np, plain_model):
     return torch.cat(packed_fp, dim=-1)
 
 # ==========================================
-# 2. 测试环境
+# 2. 测试环境 (已修正)
 # ==========================================
 @pytest.fixture(scope="module")
 def sf_setup():
@@ -58,16 +59,20 @@ def sf_setup():
     alice = sf.PYU('alice')
     bob = sf.PYU('bob')
     
+    # [FIX 2] 使用 spu.ProtocolKind 而非 sf.utils.testing.spu_pb2
     cluster_def = sf.utils.testing.cluster_def(
         ['alice', 'bob'],
         runtime_config={
-            'protocol': sf.utils.testing.spu_pb2.SEMI2K,
-            'field': sf.utils.testing.spu_pb2.FM64,
+            'protocol': spu.ProtocolKind.SEMI2K,
+            'field': spu.FieldType.FM64,
             'enable_pphlo_profile': False
         }
     )
-    spu = sf.SPU(cluster_def)
-    yield alice, bob, spu
+    # 注意这里变量名改为 spu_device 防止与 import spu 冲突
+    spu_device = sf.SPU(cluster_def)
+    
+    yield alice, bob, spu_device
+    
     sf.shutdown()
 
 class TestAccuracyAndPerformance:
@@ -118,7 +123,8 @@ class TestAccuracyAndPerformance:
         ]
 
     def test_recall_and_perf(self, sf_setup, dataset, model_configs):
-        alice, bob, spu = sf_setup
+        # 注意这里解包变量名要对应 fixture 的 yield
+        alice, bob, spu_device = sf_setup
         db, qs, gt_indices = dataset['db'], dataset['qs'], dataset['gt']
         device = dataset['device']
         
@@ -133,7 +139,6 @@ class TestAccuracyAndPerformance:
         
         for cfg in model_configs:
             # 1. 准备明文模型 (作为参数源和搜索引擎)
-            # 必须用真实数据训练，否则 Recall 无法计算
             plain_model = UnifiedLSHRetriever(
                 input_dim=960, 
                 total_bits=BITS, 
@@ -146,7 +151,7 @@ class TestAccuracyAndPerformance:
             
             # 2. 实例化秘密模型
             secret_model = UnifiedSecretHadamardRetriever(
-                spu, plain_model, alice, bob,
+                spu_device, plain_model, alice, bob,
                 num_tables=cfg['tables'],
                 use_fwht=cfg['fwht'],
                 use_public_perm=cfg['public_perm']
@@ -156,15 +161,14 @@ class TestAccuracyAndPerformance:
             t_build = secret_model.build_secret()
             
             # 4. Query 阶段 (性能 + 召回)
-            # 使用全部测试查询 (100条)
             qs_np = qs.cpu().numpy()
             
             try:
                 # 只有 SecretPerm 模式下，为了防超时，我们只测少量数据
                 if not cfg['public_perm']:
-                    qs_subset = qs_np[:10]
-                    gt_subset = gt_indices[:10]
-                    bs = 10
+                    qs_subset = qs_np[:5] # 进一步减小以防超时
+                    gt_subset = gt_indices[:5]
+                    bs = 5
                 else:
                     qs_subset = qs_np
                     gt_subset = gt_indices
@@ -179,7 +183,6 @@ class TestAccuracyAndPerformance:
                 q_fp_packed = pack_secret_output(fp_01, plain_model)
                 
                 # b. 在明文库中检索
-                # query_with_fingerprints 返回 (Batch, K) 的索引
                 _, pred_indices = plain_model.query_with_fingerprints(q_fp_packed, k=TOP_K)
                 
                 # c. 计算交集 (Recall)
@@ -198,12 +201,8 @@ class TestAccuracyAndPerformance:
                 print(f"{cfg['name']:<25} | {recall:.2%}   | {latency:.4f}     | {qps:.2f}     | {t_build:.4f}")
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"{cfg['name']:<25} | ERROR: {str(e)[:30]}...")
 
     print("-" * 110)
-    print("💡 预期结果解读:")
-    print("1. [Prod] 和 [SecretPerm] 的 Recall 应该非常接近 (例如 >50%)，且 QPS 差距巨大。")
-    print("2. [No-FWHT] 的 Recall 应该显著低于前两者 (例如 <10%)，证明 FWHT 对准确率至关重要。")
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s", "--tb=short"])
