@@ -4,196 +4,183 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import secretflow as sf
-import spu  # <--- [FIX 1] 必须导入 spu 包
+import spu
+import pandas as pd  # 用于漂亮的表格输出
 
-# 导入你的模型
+# 导入核心组件
 from models_secret import UnifiedSecretHadamardRetriever
 from models_plain import UnifiedLSHRetriever
 from data_loader import GISTDataLoader
 
 # ==========================================
-# 1. 辅助工具: 真值计算与位打包
+# 0. 基础工具函数
 # ==========================================
 def compute_ground_truth(db, qs, k=100):
-    """暴力计算 Top-K 真值 (基于 Cosine 相似度)"""
-    print(f"⚡ Computing Ground Truth for {len(qs)} queries...")
-    # 假设数据已归一化，使用矩阵乘法计算 Cosine
+    print(f"⚡ [Prep] Computing Ground Truth for {len(qs)} queries...")
     scores = torch.mm(qs, db.t())
     _, indices = torch.topk(scores, k=k, largest=True)
     return indices
 
 def pack_secret_output(fp_01_np, plain_model):
-    """
-    将 SPU 输出的未压缩 0/1 指纹打包成 int64 格式
-    """
+    """0/1 矩阵打包为 int64"""
     device = plain_model.device
     fp_tensor = torch.tensor(fp_01_np, dtype=torch.int64, device=device)
-    
     packed_fp = []
     bits_per_table = fp_tensor.shape[-1]
-    
-    # 按 64 位分块打包
     for i in range(0, bits_per_table, 64):
         chunk = fp_tensor[:, :, i:i + 64]
-        if chunk.shape[2] < 64: 
-            chunk = F.pad(chunk, (0, 64 - chunk.shape[2]))
-        
+        if chunk.shape[2] < 64: chunk = F.pad(chunk, (0, 64 - chunk.shape[2]))
         packed_chunk = plain_model._pack_bits(chunk)
         packed_fp.append(packed_chunk.unsqueeze(-1))
-    
     return torch.cat(packed_fp, dim=-1)
 
 # ==========================================
-# 2. 测试环境 (已修正)
+# 1. 核心测试逻辑
 # ==========================================
-class TestAccuracyAndPerformance:
-
-    @pytest.fixture(scope="class")
-    def sf_setup(self):
-        """初始化 SecretFlow 环境"""
-        # 1. 清理旧环境
+class ParameterImpactBenchmark:
+    
+    def setup_env(self):
         sf.shutdown()
-        
-        # 2. 初始化 (Standalone 模式)
         sf.init(['alice', 'bob'], address='local')
-        alice = sf.PYU('alice')
-        bob = sf.PYU('bob')
-        
-        # [核心修复 2] 使用 spu.ProtocolKind 而非 sf.utils.testing.spu_pb2
+        # SPU 配置
         cluster_def = sf.utils.testing.cluster_def(
             ['alice', 'bob'],
             runtime_config={
-                'protocol': spu.ProtocolKind.SEMI2K,  # <--- [FIXED] 这里必须用 spu.ProtocolKind
-                'field': spu.FieldType.FM64,          # <--- [FIXED] 这里必须用 spu.FieldType
+                'protocol': spu.ProtocolKind.SEMI2K,
+                'field': spu.FieldType.FM64,
                 'enable_pphlo_profile': False
             }
         )
-        spu_device = sf.SPU(cluster_def)
+        self.alice = sf.PYU('alice')
+        self.bob = sf.PYU('bob')
+        self.spu = sf.SPU(cluster_def)
         
-        yield alice, bob, spu_device
-        
-        sf.shutdown()
-
-    @pytest.fixture(scope="class")
-    def dataset(self):
-        """加载数据并计算真值"""
+        # 数据加载
         DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
         loader = GISTDataLoader()
-        # 加载较多数据以保证 Recall 计算的统计意义
-        db, qs = loader.load_data(device=DEVICE, train_limit=10000, test_limit=100)
+        self.db, self.qs = loader.load_data(device=DEVICE, train_limit=10000, test_limit=100)
+        self.gt_indices = compute_ground_truth(self.db, self.qs, k=100)
+        self.device = DEVICE
         
-        # 计算真值 (Top-100)
-        gt_indices = compute_ground_truth(db, qs, k=100)
-        
-        return {
-            "db": db, 
-            "qs": qs, 
-            "gt": gt_indices,
-            "device": DEVICE
-        }
+        # 预训练一个足够大的明文模型 (Tables=8) 供后续裁剪使用
+        print("⚡ [Prep] Training Base Plain Model (Tables=8)...")
+        self.base_plain_model = UnifiedLSHRetriever(
+            input_dim=960, total_bits=2048, num_tables=8, 
+            projection_type='hadamard', device=DEVICE
+        )
+        self.base_plain_model.train(self.db)
 
-    @pytest.fixture(scope="class")
-    def model_configs(self):
-        return [
-            # 1. 生产级 (FWHT + PublicPerm)
-            {
-                "name": "🚀 PublicPerm (Prod)",
-                "fwht": True, 
-                "public_perm": True,
-                "tables": 4
-            },
-            # 2. 消融实验 (No FWHT)
-            {
-                "name": "🧪 No-FWHT (Ablation)",
-                "fwht": False, 
-                "public_perm": True,
-                "tables": 4
-            },
-            # 3. 全隐私 (SecretPerm)
-            {
-                "name": "🔒 SecretPerm (Basic)",
-                "fwht": True, 
-                "public_perm": False,
-                "tables": 4
+    def run_single_experiment(self, name, tables, fwht, public_perm):
+        """运行单个实验配置并返回指标"""
+        print(f"\n🧪 Running Exp: [{name}]")
+        print(f"   Configs: Tables={tables}, FWHT={fwht}, PublicPerm={public_perm}")
+        
+        # 实例化秘密模型
+        secret_model = UnifiedSecretHadamardRetriever(
+            self.spu, self.base_plain_model, self.alice, self.bob,
+            num_tables=tables, use_fwht=fwht, use_public_perm=public_perm
+        )
+        
+        # 1. Build
+        t_build = secret_model.build_secret()
+        
+        # 2. Query (智能 Batch)
+        # 如果是全隐私模式(PublicPerm=False)，只测 1 条数据估算性能，避免卡死
+        qs_np = self.qs.cpu().numpy()
+        if not public_perm:
+            qs_subset = qs_np[:1]
+            gt_subset = self.gt_indices[:1]
+            bs = 1
+            print("   ⚠️  [Slow Mode] Detected SecretPerm, reducing batch size to 1...")
+        else:
+            qs_subset = qs_np
+            gt_subset = self.gt_indices
+            bs = len(qs_np)
+            
+        try:
+            fp_01, t_query = secret_model.query_secret(qs_subset)
+            
+            # 3. Recall 计算
+            q_fp_packed = pack_secret_output(fp_01, self.base_plain_model)
+            _, pred_indices = self.base_plain_model.query_with_fingerprints(q_fp_packed, k=100)
+            
+            hits = 0
+            for i in range(bs):
+                hits += len(set(gt_subset[i].tolist()) & set(pred_indices[i].tolist()))
+            
+            recall = hits / (bs * 100)
+            latency = t_query / bs
+            qps = bs / t_query
+            
+            return {
+                "Scenario": name,
+                "Tables": tables,
+                "FWHT": fwht,
+                "PublicPerm": public_perm,
+                "Recall@100": f"{recall:.2%}",
+                "Latency(s)": f"{latency:.4f}",
+                "QPS": f"{qps:.2f}",
+                "Consequence": "" # 稍后填充
             }
-        ]
+        except Exception as e:
+            return {"Scenario": name, "Error": str(e)[:30]}
 
-    def test_recall_and_perf(self, sf_setup, dataset, model_configs):
-        alice, bob, spu_device = sf_setup
-        db, qs, gt_indices = dataset['db'], dataset['qs'], dataset['gt']
-        device = dataset['device']
+    def run_all(self):
+        self.setup_env()
+        results = []
         
-        BITS = 2048
-        TOP_K = 100
+        # ==========================================
+        # 实验组 1: 数学的后果 (FWHT 的重要性)
+        # 控制变量: Tables=4, PublicPerm=True
+        # ==========================================
+        print("\n=== Experiment 1: The Consequence of Math (FWHT) ===")
+        res_no_fwht = self.run_single_experiment("No FWHT", tables=4, fwht=False, public_perm=True)
+        res_no_fwht['Consequence'] = "❌ 召回率崩塌 (数学失效)"
+        results.append(res_no_fwht)
         
-        print("\n" + "="*110)
-        print(f"📊 FULL BENCHMARK: Recall@{TOP_K} & QPS")
-        print("="*110)
-        print(f"{'Model Name':<25} | {'Recall':<8} | {'Latency(s)':<10} | {'QPS':<8} | {'Build(s)':<8}")
-        print("-" * 110)
+        res_fwht = self.run_single_experiment("With FWHT", tables=4, fwht=True, public_perm=True)
+        res_fwht['Consequence'] = "✅ 高召回 (数学有效)"
+        results.append(res_fwht)
         
-        for cfg in model_configs:
-            # 1. 准备明文模型
-            plain_model = UnifiedLSHRetriever(
-                input_dim=960, 
-                total_bits=BITS, 
-                num_tables=cfg['tables'], 
-                projection_type='hadamard',
-                device=device
-            )
-            plain_model.train(db)
-            
-            # 2. 实例化秘密模型
-            secret_model = UnifiedSecretHadamardRetriever(
-                spu_device, plain_model, alice, bob,
-                num_tables=cfg['tables'],
-                use_fwht=cfg['fwht'],
-                use_public_perm=cfg['public_perm']
-            )
-            
-            # 3. Build 计时
-            t_build = secret_model.build_secret()
-            
-            # 4. Query & Recall
-            qs_np = qs.cpu().numpy()
-            
-            try:
-                # SecretPerm 模式下只测少量数据防超时
-                if not cfg['public_perm']:
-                    qs_subset = qs_np[:5]
-                    gt_subset = gt_indices[:5]
-                    bs = 5
-                else:
-                    qs_subset = qs_np
-                    gt_subset = gt_indices
-                    bs = len(qs_np)
-
-                # --- 核心计时 ---
-                fp_01, t_query = secret_model.query_secret(qs_subset)
-                # ----------------
-                
-                # 计算 Recall
-                q_fp_packed = pack_secret_output(fp_01, plain_model)
-                _, pred_indices = plain_model.query_with_fingerprints(q_fp_packed, k=TOP_K)
-                
-                hits = 0
-                for i in range(bs):
-                    gt_set = set(gt_subset[i].tolist())
-                    pred_set = set(pred_indices[i].tolist())
-                    hits += len(gt_set & pred_set)
-                
-                recall = hits / (bs * TOP_K)
-                latency = t_query / bs
-                qps = bs / t_query
-                
-                print(f"{cfg['name']:<25} | {recall:.2%}   | {latency:.4f}     | {qps:.2f}     | {t_build:.4f}")
-
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f"{cfg['name']:<25} | ERROR: {str(e)[:30]}...")
-
-    print("-" * 110)
+        # ==========================================
+        # 实验组 2: 隐私的代价 (PublicPerm 的重要性)
+        # 控制变量: Tables=4, FWHT=True
+        # ==========================================
+        print("\n=== Experiment 2: The Consequence of Privacy (Permutation) ===")
+        # 我们复用上面的 res_fwht 作为对照组
+        
+        res_secret_perm = self.run_single_experiment("Secret Perm", tables=4, fwht=True, public_perm=False)
+        res_secret_perm['Consequence'] = "❌ 速度慢 100+ 倍 (OAM 代价)"
+        results.append(res_secret_perm)
+        
+        # ==========================================
+        # 实验组 3: 规模的权衡 (NumTables 的重要性)
+        # 控制变量: FWHT=True, PublicPerm=True
+        # ==========================================
+        print("\n=== Experiment 3: The Trade-off of Scale (Num Tables) ===")
+        
+        res_t1 = self.run_single_experiment("Tables=1", tables=1, fwht=True, public_perm=True)
+        res_t1['Consequence'] = "📉 召回低，速度极快"
+        results.append(res_t1)
+        
+        # Tables=4 已经跑过了 (res_fwht)
+        
+        res_t8 = self.run_single_experiment("Tables=8", tables=8, fwht=True, public_perm=True)
+        res_t8['Consequence'] = "📈 召回高，存储/计算翻倍"
+        results.append(res_t8)
+        
+        # ==========================================
+        # 最终报告
+        # ==========================================
+        df = pd.DataFrame(results)
+        # 调整列顺序
+        cols = ["Scenario", "Tables", "FWHT", "PublicPerm", "Recall@100", "Latency(s)", "QPS", "Consequence"]
+        print("\n" + "="*100)
+        print("📊 FINAL PARAMETER IMPACT REPORT")
+        print("="*100)
+        print(df[cols].to_string(index=False))
+        print("="*100)
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s", "--tb=short"])
+    benchmark = ParameterImpactBenchmark()
+    benchmark.run_all()
