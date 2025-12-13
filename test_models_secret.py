@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import secretflow as sf
-import spu  # <--- [核心修复 1] 必须直接导入 spu 包
+import spu  # <--- [FIX 1] 必须导入 spu 包
 
 # 导入你的模型
 from models_secret import UnifiedSecretHadamardRetriever
@@ -17,6 +17,7 @@ from data_loader import GISTDataLoader
 def compute_ground_truth(db, qs, k=100):
     """暴力计算 Top-K 真值 (基于 Cosine 相似度)"""
     print(f"⚡ Computing Ground Truth for {len(qs)} queries...")
+    # 假设数据已归一化，使用矩阵乘法计算 Cosine
     scores = torch.mm(qs, db.t())
     _, indices = torch.topk(scores, k=k, largest=True)
     return indices
@@ -43,7 +44,7 @@ def pack_secret_output(fp_01_np, plain_model):
     return torch.cat(packed_fp, dim=-1)
 
 # ==========================================
-# 2. 测试环境 (已针对你的环境修正)
+# 2. 测试环境 (已修正)
 # ==========================================
 class TestAccuracyAndPerformance:
 
@@ -59,12 +60,11 @@ class TestAccuracyAndPerformance:
         bob = sf.PYU('bob')
         
         # [核心修复 2] 使用 spu.ProtocolKind 而非 sf.utils.testing.spu_pb2
-        # 这是为了匹配你 main.py 中的正确写法
         cluster_def = sf.utils.testing.cluster_def(
             ['alice', 'bob'],
             runtime_config={
-                'protocol': spu.ProtocolKind.SEMI2K,  # <--- 修正点
-                'field': spu.FieldType.FM64,          # <--- 修正点
+                'protocol': spu.ProtocolKind.SEMI2K,  # <--- [FIXED] 这里必须用 spu.ProtocolKind
+                'field': spu.FieldType.FM64,          # <--- [FIXED] 这里必须用 spu.FieldType
                 'enable_pphlo_profile': False
             }
         )
