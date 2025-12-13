@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from lsh_core import LSHBase, fast_walsh_hadamard_transform
+from lsh_core import fast_walsh_hadamard_transform
 
 class LSHBase:
     def __init__(self, device='cpu'):

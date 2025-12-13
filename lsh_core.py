@@ -24,57 +24,45 @@ def fast_walsh_hadamard_transform(x, normalize=True):
     return out
 
 
+# ==========================================
+# 1. 核心算子: SPU-Friendly FWHT
+# ==========================================
 def sf_fwht(x, normalize=False):
-    """ JAX/SPU 版 FWHT """
+    """
+    JAX/SPU 版快速沃尔什-哈达玛变换 (FWHT)
+    修正了 Reshape/Stack 逻辑以确保数学正确性和 SPU 编译器友好性。
+    """
     shape = x.shape
     N = shape[-1]
+    
+    # 检查维度是否为 2 的幂 (FWHT 硬性要求)
+    if (N & (N - 1)) != 0:
+        raise ValueError(f"FWHT input dim must be power of 2, got {N}")
+
+    # 将最后两维展平处理，支持 Batch
     x_flat = x.reshape(-1, N)
     B_total = x_flat.shape[0]
     out = x_flat
+    
     h = 1
     while h < N:
+        # [Correctness Fix] 使用 stack 而非 concatenate 以明确内存布局
+        # 这在 SPU IR 中更容易被优化为 View 操作
         out = out.reshape(B_total, N // (2 * h), 2, h)
         x1 = out[:, :, 0, :]
         x2 = out[:, :, 1, :]
-        out = jnp.concatenate((x1 + x2, x1 - x2), axis=2)
+        
+        # Butterfly Operation
+        # stack axis=2 -> (B, N/2h, 2, h)
+        out = jnp.stack([x1 + x2, x1 - x2], axis=2)
         h *= 2
+        
     out = out.reshape(shape)
+    
+    # [Theory Fix] 可选归一化，保持正交性
+    # 注意: 在 Sign-LSH 中即使不归一化也不影响符号位，但在 MPC 中除法较慢
     if normalize:
-        out = out / jnp.sqrt(N)
+        out = out * (1.0 / jnp.sqrt(N)) # 使用乘法替代除法加速
+        
     return out
 
-
-# --- LSH 基类 ---
-
-class LSHBase:
-    def __init__(self, device):
-        self.device = device
-        self.bit_powers = (2 ** torch.arange(64, device=device)).to(torch.int64)
-        self.db_fingerprints = None
-
-    def _pack_bits(self, bool_tensor):
-        """ 将 bool tensor 压缩为 int64 """
-        return (bool_tensor.to(torch.int64) * self.bit_powers).sum(dim=-1)
-
-    def _popcount_swar(self, n):
-        """ SWAR 算法计算汉明重量 """
-        n = n - ((n >> 1) & 0x5555555555555555)
-        n = (n & 0x3333333333333333) + ((n >> 2) & 0x3333333333333333)
-        n = (n + (n >> 4)) & 0x0f0f0f0f0f0f0f0f
-        n = (n * 0x0101010101010101) >> 56
-        return n
-
-    def query_with_fingerprints(self, q_fingerprints, k):
-        """ 使用预计算的指纹进行查询 """
-        is_multi_table = (q_fingerprints.dim() == 3)
-        # 广播异或
-        xor = torch.bitwise_xor(q_fingerprints.unsqueeze(1), self.db_fingerprints.unsqueeze(0))
-
-        if is_multi_table:
-            # 多表求和: (Batch, DB_Size, Tables) -> (Batch, DB_Size)
-            dists = self._popcount_swar(xor).sum(dim=-1).sum(dim=-1)
-        else:
-            # 单表求和: (Batch, DB_Size, Chunks) -> (Batch, DB_Size)
-            dists = self._popcount_swar(xor).sum(dim=2)
-
-        return torch.topk(dists, k=k, dim=1, largest=False)

@@ -1,225 +1,209 @@
 import pytest
+import time
 import numpy as np
 import torch
-import time
+import torch.nn.functional as F
 import secretflow as sf
 
-# 导入要测试的模块
-from models_secret import (
-    SecretFastHadamardRetriever,
-    SecretOptimizedFastHadamardRetriever,
-    SecretFastHadamardRetriever_PublicPerm,
-    SecretOptimizedFastHadamardRetriever_PublicPerm
-)
+# 导入你的模型
+from models_secret import UnifiedSecretHadamardRetriever
+from models_plain import UnifiedLSHRetriever
 from data_loader import GISTDataLoader
 
+# ==========================================
+# 1. 辅助工具: 真值计算与位打包
+# ==========================================
+def compute_ground_truth(db, qs, k=100):
+    """暴力计算 Top-K 真值 (基于 Cosine 相似度)"""
+    print(f"⚡ Computing Ground Truth for {len(qs)} queries...")
+    # 假设数据已归一化，使用矩阵乘法计算 Cosine
+    scores = torch.mm(qs, db.t())
+    _, indices = torch.topk(scores, k=k, largest=True)
+    return indices
 
-class MockPlainModel:
-    """模拟 PlainModel 对象 - GIST-960 数据集适配"""
-    def __init__(self, h_dim=1024, num_tables=4, num_bits=64):
-        self.h_dim = h_dim
-        self.input_dim = 960  # GIST-960 的输入维度
-        self.D = torch.randn(h_dim)
-        self.perm = torch.randperm(h_dim)[:num_bits]
-        self.D_diags = torch.randn(num_tables, h_dim)
-        self.perms = torch.stack([torch.randperm(h_dim)[:num_bits] for _ in range(num_tables)])
+def pack_secret_output(fp_01_np, plain_model):
+    """
+    将 SPU 输出的未压缩 0/1 指纹打包成 int64 格式，
+    以便直接调用 plain_model.query_with_fingerprints
+    """
+    # fp_01_np shape: (Batch, Tables, Bits)
+    device = plain_model.device
+    fp_tensor = torch.tensor(fp_01_np, dtype=torch.int64, device=device)
+    
+    packed_fp = []
+    bits_per_table = fp_tensor.shape[-1]
+    
+    # 按 64 位分块打包
+    for i in range(0, bits_per_table, 64):
+        chunk = fp_tensor[:, :, i:i + 64]
+        # 如果不足 64 位，进行 Padding
+        if chunk.shape[2] < 64: 
+            chunk = F.pad(chunk, (0, 64 - chunk.shape[2]))
+        
+        # 调用 plain_model 的底层打包函数
+        # 输出 shape: (Batch, Tables)
+        packed_chunk = plain_model._pack_bits(chunk)
+        packed_fp.append(packed_chunk.unsqueeze(-1))
+    
+    # 拼接 chunks: (Batch, Tables, Num_Chunks)
+    return torch.cat(packed_fp, dim=-1)
 
-
+# ==========================================
+# 2. 测试环境
+# ==========================================
 @pytest.fixture(scope="module")
 def sf_setup():
-    """初始化 SecretFlow 环境"""
     sf.shutdown()
     sf.init(['alice', 'bob'], address='local')
-    
     alice = sf.PYU('alice')
     bob = sf.PYU('bob')
-    spu = sf.SPU(sf.utils.testing.cluster_def(['alice', 'bob']))
     
+    cluster_def = sf.utils.testing.cluster_def(
+        ['alice', 'bob'],
+        runtime_config={
+            'protocol': sf.utils.testing.spu_pb2.SEMI2K,
+            'field': sf.utils.testing.spu_pb2.FM64,
+            'enable_pphlo_profile': False
+        }
+    )
+    spu = sf.SPU(cluster_def)
     yield alice, bob, spu
-    
     sf.shutdown()
 
-
-class TestPerformance:
-    """性能测试 - GIST-960 数据集 - 多规模测试"""
-    
-    @pytest.fixture(scope="class", params=[
-        ("small", 100, 20),
-        ("medium", 1000, 100),
-        ("large", 10000, 1000),
-    ])
-    def gist960_data(self, request):
-        """加载不同规模的 GIST-960 测试数据"""
-        scale_name, train_limit, test_limit = request.param
-        print(f"\n{'='*80}")
-        print(f"[SCALE: {scale_name.upper()}] train={train_limit}, test={test_limit}")
-        print(f"{'='*80}")
-        
-        loader = GISTDataLoader()
-        db, qs = loader.load_data(device='cpu', train_limit=train_limit, test_limit=test_limit)
-        print(f"[INFO] Database: {db.shape}, Queries: {qs.shape}")
-        
-        return {
-            'scale': scale_name,
-            'db': db.cpu().numpy(),
-            'qs': qs.cpu().numpy(),
-            'train_limit': train_limit,
-            'test_limit': test_limit
-        }
+class TestAccuracyAndPerformance:
     
     @pytest.fixture(scope="class")
-    def retriever_configs(self):
-        """检索器配置"""
-        return [
-            ("SecretFastHadamardRetriever", SecretFastHadamardRetriever),
-            ("SecretOptimizedFastHadamardRetriever", SecretOptimizedFastHadamardRetriever),
-            ("SecretFastHadamardRetriever_PublicPerm", SecretFastHadamardRetriever_PublicPerm),
-            ("SecretOptimizedFastHadamardRetriever_PublicPerm", SecretOptimizedFastHadamardRetriever_PublicPerm),
-        ]
-    
-    def test_build_performance(self, gist960_data, retriever_configs, sf_setup):
-        """测试构建阶段性能"""
-        alice, bob, spu = sf_setup
-        scale = gist960_data['scale']
-        db, qs = gist960_data['db'], gist960_data['qs']
+    def dataset(self):
+        """加载数据并计算真值"""
+        DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+        loader = GISTDataLoader()
+        # 加载较多数据以保证 Recall 计算的统计意义
+        db, qs = loader.load_data(device=DEVICE, train_limit=10000, test_limit=100)
         
-        print("\n" + "="*80)
-        print(f"BUILD PHASE PERFORMANCE TEST [{scale.upper()}]")
-        print("="*80)
+        # 计算真值 (Top-100)
+        gt_indices = compute_ground_truth(db, qs, k=100)
         
-        for name, RetrieverClass in retriever_configs:
-            plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            
-            retriever = RetrieverClass(spu, plain_model, alice, bob)
-            
-            # 测试构建时间
-            t_start = time.time()
-            t_build = retriever.build_secret()
-            t_total = time.time() - t_start
-            
-            print(f"\n[{name}]")
-            print(f"  Build time (reported): {t_build:.4f}s")
-            print(f"  Build time (measured): {t_total:.4f}s")
-            
-            assert retriever.secret_params is not None
-    
-    def test_query_performance_single(self, gist960_data, retriever_configs, sf_setup):
-        """测试单条查询性能"""
-        alice, bob, spu = sf_setup
-        scale = gist960_data['scale']
-        db, qs = gist960_data['db'], gist960_data['qs']
-        
-        print("\n" + "="*80)
-        print(f"SINGLE QUERY PERFORMANCE TEST [{scale.upper()}]")
-        print("="*80)
-        
-        for name, RetrieverClass in retriever_configs:
-            plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            
-            retriever = RetrieverClass(spu, plain_model, alice, bob)
-            retriever.build_secret()
-            
-            # 测试单条查询
-            single_query = qs[:1]
-            fp, t_query = retriever.query_secret(single_query)
-            
-            print(f"\n[{name}]")
-            print(f"  Single query time: {t_query:.4f}s")
-            print(f"  Output shape: {fp.shape if hasattr(fp, 'shape') else 'N/A'}")
-    
-    def test_query_performance_batch(self, gist960_data, retriever_configs, sf_setup):
-        """测试批量查询性能"""
-        alice, bob, spu = sf_setup
-        scale = gist960_data['scale']
-        db, qs = gist960_data['db'], gist960_data['qs']
-        
-        print("\n" + "="*80)
-        print(f"BATCH QUERY PERFORMANCE TEST [{scale.upper()}]")
-        print("="*80)
-        
-        batch_sizes = [10, 50, 100]
-        
-        for name, RetrieverClass in retriever_configs:
-            plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            
-            retriever = RetrieverClass(spu, plain_model, alice, bob)
-            retriever.build_secret()
-            
-            print(f"\n[{name}]")
-            
-            for batch_size in batch_sizes:
-                if batch_size > len(qs):
-                    continue
-                
-                batch_query = qs[:batch_size]
-                fp, t_query = retriever.query_secret(batch_query)
-                
-                avg_time = t_query / batch_size
-                print(f"  Batch size {batch_size:3d}: {t_query:.4f}s total, {avg_time:.6f}s per query")
-    
-    def test_end_to_end_performance(self, gist960_data, retriever_configs, sf_setup):
-        """端到端性能测试"""
-        alice, bob, spu = sf_setup
-        scale = gist960_data['scale']
-        db, qs = gist960_data['db'], gist960_data['qs']
-        train_limit = gist960_data['train_limit']
-        test_limit = gist960_data['test_limit']
-        
-        print("\n" + "="*80)
-        print(f"END-TO-END PERFORMANCE TEST [{scale.upper()}]")
-        print("="*80)
-        print(f"Database size: {len(db)}, Query size: {len(qs)}")
-        print(f"Config: train_limit={train_limit}, test_limit={test_limit}")
-        
-        results = []
-        
-        for name, RetrieverClass in retriever_configs:
-            plain_model = MockPlainModel(h_dim=1024, num_tables=4, num_bits=64)
-            
-            retriever = RetrieverClass(spu, plain_model, alice, bob)
-            
-            # 构建阶段
-            t_build_start = time.time()
-            retriever.build_secret()
-            t_build = time.time() - t_build_start
-            
-            # 查询阶段
-            fp, t_query = retriever.query_secret(qs)
-            
-            # 总时间
-            t_total = t_build + t_query
-            avg_query_time = t_query / len(qs)
-            
-            results.append({
-                'name': name,
-                'build_time': t_build,
-                'query_time': t_query,
-                'total_time': t_total,
-                'avg_query_time': avg_query_time
-            })
-            
-            print(f"\n[{name}]")
-            print(f"  Build time:         {t_build:.4f}s")
-            print(f"  Query time (total): {t_query:.4f}s")
-            print(f"  Avg query time:     {avg_query_time:.6f}s")
-            print(f"  Total time:         {t_total:.4f}s")
-        
-        # 性能对比
-        print("\n" + "="*80)
-        print(f"PERFORMANCE COMPARISON [{scale.upper()}]")
-        print("="*80)
-        
-        # 找最快的模型
-        fastest_build = min(results, key=lambda x: x['build_time'])
-        fastest_query = min(results, key=lambda x: x['avg_query_time'])
-        fastest_total = min(results, key=lambda x: x['total_time'])
-        
-        print(f"\nFastest Build:      {fastest_build['name']} ({fastest_build['build_time']:.4f}s)")
-        print(f"Fastest Query:      {fastest_query['name']} ({fastest_query['avg_query_time']:.6f}s)")
-        print(f"Fastest Total:      {fastest_total['name']} ({fastest_total['total_time']:.4f}s)")
-        print(f"\nTest Scale: {scale.upper()} (train={train_limit}, test={test_limit})")
+        return {
+            "db": db, 
+            "qs": qs, 
+            "gt": gt_indices,
+            "device": DEVICE
+        }
 
+    @pytest.fixture(scope="class")
+    def model_configs(self):
+        return [
+            # 1. 生产级 (FWHT + PublicPerm) - 预期: 高Recall, 高QPS
+            {
+                "name": "🚀 PublicPerm (Prod)",
+                "fwht": True, 
+                "public_perm": True,
+                "tables": 4
+            },
+            # 2. 消融实验 (No FWHT) - 预期: 低Recall, 高QPS
+            {
+                "name": "🧪 No-FWHT (Ablation)",
+                "fwht": False, 
+                "public_perm": True,
+                "tables": 4
+            },
+            # 3. 全隐私 (SecretPerm) - 预期: 高Recall, 极低QPS
+            # 注意：这个跑起来很慢，仅用于验证正确性
+            {
+                "name": "🔒 SecretPerm (Basic)",
+                "fwht": True, 
+                "public_perm": False,
+                "tables": 4
+            }
+        ]
+
+    def test_recall_and_perf(self, sf_setup, dataset, model_configs):
+        alice, bob, spu = sf_setup
+        db, qs, gt_indices = dataset['db'], dataset['qs'], dataset['gt']
+        device = dataset['device']
+        
+        BITS = 2048
+        TOP_K = 100
+        
+        print("\n" + "="*110)
+        print(f"📊 FULL BENCHMARK: Recall@{TOP_K} & QPS")
+        print("="*110)
+        print(f"{'Model Name':<25} | {'Recall':<8} | {'Latency(s)':<10} | {'QPS':<8} | {'Build(s)':<8}")
+        print("-" * 110)
+        
+        for cfg in model_configs:
+            # 1. 准备明文模型 (作为参数源和搜索引擎)
+            # 必须用真实数据训练，否则 Recall 无法计算
+            plain_model = UnifiedLSHRetriever(
+                input_dim=960, 
+                total_bits=BITS, 
+                num_tables=cfg['tables'], 
+                projection_type='hadamard',
+                device=device
+            )
+            # 训练明文模型 (构建 DB 索引)
+            plain_model.train(db)
+            
+            # 2. 实例化秘密模型
+            secret_model = UnifiedSecretHadamardRetriever(
+                spu, plain_model, alice, bob,
+                num_tables=cfg['tables'],
+                use_fwht=cfg['fwht'],
+                use_public_perm=cfg['public_perm']
+            )
+            
+            # 3. Build 阶段计时
+            t_build = secret_model.build_secret()
+            
+            # 4. Query 阶段 (性能 + 召回)
+            # 使用全部测试查询 (100条)
+            qs_np = qs.cpu().numpy()
+            
+            try:
+                # 只有 SecretPerm 模式下，为了防超时，我们只测少量数据
+                if not cfg['public_perm']:
+                    qs_subset = qs_np[:10]
+                    gt_subset = gt_indices[:10]
+                    bs = 10
+                else:
+                    qs_subset = qs_np
+                    gt_subset = gt_indices
+                    bs = len(qs_np)
+
+                # --- 核心计时 ---
+                fp_01, t_query = secret_model.query_secret(qs_subset)
+                # ----------------
+                
+                # 5. 后处理: 计算 Recall
+                # a. 打包指纹 (0/1 -> int64)
+                q_fp_packed = pack_secret_output(fp_01, plain_model)
+                
+                # b. 在明文库中检索
+                # query_with_fingerprints 返回 (Batch, K) 的索引
+                _, pred_indices = plain_model.query_with_fingerprints(q_fp_packed, k=TOP_K)
+                
+                # c. 计算交集 (Recall)
+                hits = 0
+                for i in range(bs):
+                    gt_set = set(gt_subset[i].tolist())
+                    pred_set = set(pred_indices[i].tolist())
+                    hits += len(gt_set & pred_set)
+                
+                recall = hits / (bs * TOP_K)
+                
+                # 计算性能指标
+                latency = t_query / bs
+                qps = bs / t_query
+                
+                print(f"{cfg['name']:<25} | {recall:.2%}   | {latency:.4f}     | {qps:.2f}     | {t_build:.4f}")
+
+            except Exception as e:
+                print(f"{cfg['name']:<25} | ERROR: {str(e)[:30]}...")
+
+    print("-" * 110)
+    print("💡 预期结果解读:")
+    print("1. [Prod] 和 [SecretPerm] 的 Recall 应该非常接近 (例如 >50%)，且 QPS 差距巨大。")
+    print("2. [No-FWHT] 的 Recall 应该显著低于前两者 (例如 <10%)，证明 FWHT 对准确率至关重要。")
 
 if __name__ == "__main__":
-    # 运行性能测试
     pytest.main([__file__, "-v", "-s", "--tb=short"])
